@@ -1,0 +1,7 @@
+# Vendored third-party source pulled for diffing — regenerate with
+# tools/extract_reference_sources.sh
+port/
+
+# scratch
+*.pyc
+__pycache__/
