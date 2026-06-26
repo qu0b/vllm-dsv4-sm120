@@ -38,6 +38,17 @@ Four component swaps/adds + two source patches, all driven by the `Dockerfile` +
    - `models/deepseek_v4/nvidia/model.py` `_select_dsv4_attn_cls` routes to the SM120 layer when `is_device_capability_family(120)`
    - `tool_parsers/deepseekv4_tool_parser.py` + `parser/abstract_parser.py` — DSML tool-call-leak fix: disables the strict-tool-call grammar (an EOS-trap where a `<｜DSML｜tool_calls>` opened mid-`<think>` could never terminate → ~100k-token runaway) and recovers tool-calls the model emits inside `<think>` by treating the tool-call start as the end of reasoning (gated to that abnormal case, wrapped to fall back to baseline)
 
+## What this adds over `lucifer1004/dsv4-flash-sm120`
+
+This is **not** a kernel rewrite — the SM120 DeepGEMM and flashinfer `sparse_mla_sm120` are reused from lucifer1004 as-is. What it adds on top:
+
+- **Newer vLLM base — v0.23.0 vs the 0.22.x of the upstream image.** Brings upstream's SM120 b12x MoE + FP4 GEMM, the decoupled DSv4 sparse-MLA metadata, and TRTLLM-gen attention. Net warm decode lands at **~120–133 tok/s at 1M ctx — it matches and modestly beats** the 0.22.x image's ~120 tok/s, on a base that keeps tracking upstream. (The gain is the newer base, not a faster sparse-MLA kernel.)
+- **Patch-and-rebuild upgrade path.** `apply_sm120_patches.py` asserts each anchor matches exactly once, so the *next* vLLM bump fails loudly at the moved line instead of breaking silently — see the [Upgrade guide](#upgrade-guide). The whole repo exists so a base bump is a re-diff, not a from-scratch re-diagnosis.
+- **DSML tool-call-leak fix.** Disables the strict-tool-call EOS-trap grammar (a `<｜DSML｜tool_calls>` opened mid-`<think>` could never terminate → ~100k-token runaway) and recovers tool-calls emitted inside `<think>`. A correctness/robustness fix, gated to the abnormal case and wrapped to fall back to baseline.
+- **Tuned, documented serving defaults** in `run_dsv4_flash.sh` — the config that produces the speed ladder below: cudagraph `FULL_AND_PIECEWISE` + `custom_ops:["all"]` + async scheduling, MTP-2 (accept-len ~2.1), expert-parallel (`allgather_reducescatter`) + EPLB with redundant experts, `block-size 256`, `gpu-memory-utilization 0.965`, 1M context.
+
+> Throughput is at parity (slight beat) with the upstream image — if you need a raw-speed win, that lives in the SM120 kernels themselves, not here. This fork's value is *newer-vLLM + maintainable + correct*.
+
 ## Quickstart
 
 ```bash
