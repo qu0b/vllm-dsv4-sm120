@@ -40,7 +40,10 @@ Four component swaps/adds + two source patches, all driven by the `Dockerfile` +
 
 ## What this adds over `lucifer1004/dsv4-flash-sm120`
 
-This is **not** a kernel rewrite — the SM120 DeepGEMM and flashinfer `sparse_mla_sm120` are reused from lucifer1004 as-is. The speed comes from the base + serving config, not from faster kernels. What it adds on top:
+Two baselines, don't conflate them:
+
+- **vs stock vLLM v0.23.0** — this image *unlocks* the SM120 kernel paths stock blocks: it opens vLLM's `deep_gemm` arch gate so the dense FP8 linears run on DeepGEMM's SM120 block-scaled kernels (instead of the CUTLASS fallback that has no SM120 dispatch → crash), and wires up `run_sparse_mla` (the only SM120 sparse-MLA decode kernel, which stock never calls). That's the difference between *crash* and *180 tok/s* — see [Why stock doesn't work](#why-stock-v0230-doesnt-work-on-sm120) + [The fix](#the-fix-what-this-image-changes). We don't *author* the CUDA (DeepGEMM and flashinfer `sparse_mla_sm120` are lucifer1004's); we make vLLM actually dispatch to it on SM120.
+- **vs lucifer1004's image** (the comparison below) — their 0.22.x image already unlocked those same kernel paths; we reuse their kernels and re-port the same unlocks to v0.23.0. So relative to *them* the deltas are base + config + correctness, not new kernel unlocks:
 
 - **~180 tok/s warm single-stream decode** (measured on this image: `bench.py 5 800` → 170–190 tok/s, avg ~178; short prompt, 800-token generations, MTP-2, temp 0, reasoning on). The 0.22.x reference image was documented at ~120 tok/s. This is **not a controlled head-to-head** (context length and measurement method may differ), but on the same box this image clears the reference figure comfortably.
 - **Newer vLLM base — v0.23.0 vs the 0.22.x of the upstream image.** Brings upstream's SM120 b12x MoE + FP4 GEMM, the decoupled DSv4 sparse-MLA metadata, and TRTLLM-gen attention — and keeps tracking upstream.
