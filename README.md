@@ -1,6 +1,6 @@
 # vllm-dsv4-sm120
 
-Run **DeepSeek-V4-Flash** on **vLLM v0.23.0** on **SM120** (RTX PRO 6000 / Blackwell, cc 12.0) — coherent, with the full feature set, at **~120–133 tok/s and 1M context**.
+Run **DeepSeek-V4-Flash** on **vLLM v0.23.0** on **SM120** (RTX PRO 6000 / Blackwell, cc 12.0) — coherent, with the full feature set, at **~180 tok/s warm single-stream decode and 1M context**.
 
 This is a derived image: it takes the stock `vllm/vllm-openai:v0.23.0` and adds the SM120 sparse-MLA support that upstream vLLM doesn't ship, forward-ported from [lucifer1004]'s SM120 work. The point of this repo is to make **future vLLM upgrades a patch-and-rebuild** instead of a from-scratch re-diagnosis — see [Upgrade guide](#upgrade-guide).
 
@@ -9,8 +9,8 @@ This is a derived image: it takes the stock `vllm/vllm-openai:v0.23.0` and adds 
 | Target model | `DeepSeek-V4-Flash` (FP8/MXFP4, sparse MLA + lightning indexer, C4A/C128A hybrid) |
 | Base image | `vllm/vllm-openai:v0.23.0` (vllm 0.23.0, py3.12.13, torch 2.11.0+cu130, cuda 13.0) |
 | Hardware | 2× RTX PRO 6000 Blackwell, cc 12.0 (sm_120), no NVLink (PCIe) |
-| Result | ~120–133 tok/s warm decode, 1M ctx, MTP-2 accept-len ~2.1, tool-calling + reasoning OK |
-| Parity | matches/beats the `lucifer1004/dsv4-flash-sm120` 0.22.x image (120 tok/s + 1M ctx), on newer vLLM |
+| Result | **~180 tok/s** warm single-stream decode (measured: 5×800-tok gen, 170–190 tok/s), 1M ctx, MTP-2 accept-len ~2.1, tool-calling + reasoning OK |
+| Baseline | the `lucifer1004/dsv4-flash-sm120` 0.22.x reference image was documented at ~120 tok/s + 1M ctx; this image reuses its SM120 kernels on a newer vLLM (see [What this adds](#what-this-adds-over-lucifer1004dsv4-flash-sm120)) |
 
 ## Why stock v0.23.0 doesn't work on SM120
 
@@ -40,14 +40,15 @@ Four component swaps/adds + two source patches, all driven by the `Dockerfile` +
 
 ## What this adds over `lucifer1004/dsv4-flash-sm120`
 
-This is **not** a kernel rewrite — the SM120 DeepGEMM and flashinfer `sparse_mla_sm120` are reused from lucifer1004 as-is. What it adds on top:
+This is **not** a kernel rewrite — the SM120 DeepGEMM and flashinfer `sparse_mla_sm120` are reused from lucifer1004 as-is. The speed comes from the base + serving config, not from faster kernels. What it adds on top:
 
-- **Newer vLLM base — v0.23.0 vs the 0.22.x of the upstream image.** Brings upstream's SM120 b12x MoE + FP4 GEMM, the decoupled DSv4 sparse-MLA metadata, and TRTLLM-gen attention. Net warm decode lands at **~120–133 tok/s at 1M ctx — it matches and modestly beats** the 0.22.x image's ~120 tok/s, on a base that keeps tracking upstream. (The gain is the newer base, not a faster sparse-MLA kernel.)
+- **~180 tok/s warm single-stream decode** (measured on this image: `bench.py 5 800` → 170–190 tok/s, avg ~178; short prompt, 800-token generations, MTP-2, temp 0, reasoning on). The 0.22.x reference image was documented at ~120 tok/s. This is **not a controlled head-to-head** (context length and measurement method may differ), but on the same box this image clears the reference figure comfortably.
+- **Newer vLLM base — v0.23.0 vs the 0.22.x of the upstream image.** Brings upstream's SM120 b12x MoE + FP4 GEMM, the decoupled DSv4 sparse-MLA metadata, and TRTLLM-gen attention — and keeps tracking upstream.
+- **Tuned, documented serving defaults** in `run_dsv4_flash.sh` — the config that produces the speed ladder below: cudagraph `FULL_AND_PIECEWISE` + `custom_ops:["all"]` + async scheduling, MTP-2 (accept-len ~2.1), expert-parallel (`allgather_reducescatter`) + EPLB with redundant experts, `block-size 256`, `gpu-memory-utilization 0.965`, 1M context.
 - **Patch-and-rebuild upgrade path.** `apply_sm120_patches.py` asserts each anchor matches exactly once, so the *next* vLLM bump fails loudly at the moved line instead of breaking silently — see the [Upgrade guide](#upgrade-guide). The whole repo exists so a base bump is a re-diff, not a from-scratch re-diagnosis.
 - **DSML tool-call-leak fix.** Disables the strict-tool-call EOS-trap grammar (a `<｜DSML｜tool_calls>` opened mid-`<think>` could never terminate → ~100k-token runaway) and recovers tool-calls emitted inside `<think>`. A correctness/robustness fix, gated to the abnormal case and wrapped to fall back to baseline.
-- **Tuned, documented serving defaults** in `run_dsv4_flash.sh` — the config that produces the speed ladder below: cudagraph `FULL_AND_PIECEWISE` + `custom_ops:["all"]` + async scheduling, MTP-2 (accept-len ~2.1), expert-parallel (`allgather_reducescatter`) + EPLB with redundant experts, `block-size 256`, `gpu-memory-utilization 0.965`, 1M context.
 
-> Throughput is at parity (slight beat) with the upstream image — if you need a raw-speed win, that lives in the SM120 kernels themselves, not here. This fork's value is *newer-vLLM + maintainable + correct*.
+> Reproduce the decode number: `BENCH_MODEL=starflinger BENCH_KEY=<key> python bench.py 5 800` against a warm server.
 
 ## Quickstart
 
@@ -55,14 +56,14 @@ This is **not** a kernel rewrite — the SM120 DeepGEMM and flashinfer `sparse_m
 # Build (GPU-free, ~2 min; pulls the base + lucifer1004 image for the swaps):
 docker build -t dsv4-flash-v023-sm120:latest .
 
-# Run (defaults = cudagraph + MTP-2 + EP + EPLB + 1M ctx, ~120 tok/s):
+# Run (defaults = cudagraph + MTP-2 + EP + EPLB + 1M ctx, ~180 tok/s warm decode):
 ./run_dsv4_flash.sh
 # health:  curl -H "Authorization: Bearer $KEY" http://localhost:8002/health
 ```
 
 Run-script env knobs (fast iteration): `IMAGE CONTAINER_NAME ATTN_BACKEND BLOCK_SIZE MAX_LEN GPU_MEM MAX_SEQS ENFORCE_EAGER(0/1) USE_SPEC(0/1) USE_EPLB(0/1) USE_EP(0/1)`. For bring-up/debug use `ENFORCE_EAGER=1 USE_SPEC=0 MAX_LEN=32768` (correctness-only, ~12 tok/s).
 
-Speed ladder (this image): eager+32k ≈ 12 tok/s → +cudagraph ≈ 37 → +MTP-2+EP+1M ≈ 120–133. First request after boot is slow (cute_dsl + MTP cold-warm), then steady.
+Speed ladder (this image): eager+32k ≈ 12 tok/s → +cudagraph ≈ 37 → +MTP-2+EP+1M ≈ **170–190** (warm single-stream decode). First request after boot is slow (cute_dsl + MTP cold-warm), then steady.
 
 ## Repo layout
 
